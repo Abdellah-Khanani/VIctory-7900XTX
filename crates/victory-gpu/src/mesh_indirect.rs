@@ -174,7 +174,7 @@ pub(crate) struct Signatures {
 
 pub(crate) fn signatures(
     device: &ID3D12Device,
-    root: &ID3D12RootSignature,
+    (compute_root, draw_root): (&ID3D12RootSignature, &ID3D12RootSignature),
     outputs: [u32; 3],
     vertices: u32,
     expanded: bool,
@@ -212,7 +212,7 @@ pub(crate) fn signatures(
             D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED
         }),
     ];
-    let make = |args: &[D3D12_INDIRECT_ARGUMENT_DESC], stride| {
+    let make = |args: &[D3D12_INDIRECT_ARGUMENT_DESC], stride, root: &ID3D12RootSignature| {
         let desc = D3D12_COMMAND_SIGNATURE_DESC {
             ByteStride: stride,
             NumArgumentDescs: args.len() as u32,
@@ -225,8 +225,8 @@ pub(crate) fn signatures(
         signature.ok_or_else(windows::core::Error::empty)
     };
     Ok(Signatures {
-        compute: make(&compute, COMPUTE_STRIDE)?,
-        draw: make(&draw, draw_stride(expanded))?,
+        compute: make(&compute, COMPUTE_STRIDE, compute_root)?,
+        draw: make(&draw, draw_stride(expanded), draw_root)?,
     })
 }
 

@@ -17,6 +17,10 @@ use windows::core::PCSTR;
 use super::{Shader, Translated};
 use crate::host::host;
 
+/// Added to the pixel stage's register spaces in a mesh fallback's compute
+/// root signature: spaces no translated shader reads.
+const UNREAD_SPACE: u32 = 100;
+
 /// A stream's graphics state, owned (the title's stream lives only for the
 /// creation call). Subobjects the stream leaves out keep D3D12's defaults.
 pub(crate) struct GraphicsState {
@@ -383,6 +387,9 @@ impl Stage {
 /// what it wrote.
 pub(crate) struct MeshFallback {
     pub(crate) compute: ID3D12PipelineState,
+    /// `compute`'s root signature: the pipeline's parameters at the same
+    /// indices, the mesh stage's visible to ALL.
+    pub(crate) compute_root: ID3D12RootSignature,
     pub(crate) layout: victory_shader::emit::MeshLayout,
     /// Root parameters of `u0`, `u1` and `u2` in `MESH_OUT_SPACE`.
     pub(crate) outputs: [u32; 3],
@@ -484,7 +491,11 @@ impl HostPipeline {
             vec![(cs, D3D12_SHADER_VISIBILITY_ALL)]
         } else {
             let first = match (mesh, find("vertex")) {
-                (Some(ms), _) if fallback.is_some() => (ms, D3D12_SHADER_VISIBILITY_ALL),
+                // The fallback draws with a vertex shader. Its compute pass
+                // gets a root signature of its own (`compute_root` below)
+                // where these parameters are visible to ALL: in one shared
+                // signature they would overlap the pixel shader's registers.
+                (Some(ms), _) if fallback.is_some() => (ms, D3D12_SHADER_VISIBILITY_VERTEX),
                 (Some(ms), _) => (ms, D3D12_SHADER_VISIBILITY_MESH),
                 (None, Some(vs)) => (vs, D3D12_SHADER_VISIBILITY_VERTEX),
                 (None, None) => return refuse("no vertex or mesh shader", shaders),
@@ -521,7 +532,12 @@ impl HostPipeline {
         let mut ranges: Vec<Box<D3D12_DESCRIPTOR_RANGE1>> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
+        // Per stage, where its parameters and samplers start.
+        let mut param_starts = Vec::new();
+        let mut sampler_starts = Vec::new();
         for &(shader, visibility) in &stages {
+            param_starts.push(params.len());
+            sampler_starts.push(samplers.len());
             let t = &shader.translated()?.host;
             let mut stage = Stage {
                 shader: shader.clone(),
@@ -676,6 +692,49 @@ impl HostPipeline {
                 return None;
             }
         };
+        // The fallback's compute pass: the same parameters at the same
+        // indices, the mesh stage's visible to ALL (compute sees only those),
+        // the pixel stage's moved to spaces nothing reads so they overlap
+        // nothing.
+        let compute_root = match &fallback {
+            Some(_) => {
+                let (mesh_params, mesh_samplers) = (
+                    param_starts[0]..param_starts.get(1).copied().unwrap_or(params.len()),
+                    sampler_starts[0]..sampler_starts.get(1).copied().unwrap_or(samplers.len()),
+                );
+                let mut cparams = params.clone();
+                for (i, p) in cparams.iter_mut().enumerate() {
+                    if mesh_params.contains(&i) {
+                        p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+                    } else if p.ShaderVisibility == D3D12_SHADER_VISIBILITY_PIXEL {
+                        // SAFETY: the union member the parameter type selects.
+                        unsafe {
+                            if p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS {
+                                p.Anonymous.Constants.RegisterSpace += UNREAD_SPACE;
+                            } else {
+                                p.Anonymous.Descriptor.RegisterSpace += UNREAD_SPACE;
+                            }
+                        }
+                    }
+                }
+                let mut csamplers = samplers.clone();
+                for (i, s) in csamplers.iter_mut().enumerate() {
+                    if mesh_samplers.contains(&i) {
+                        s.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+                    } else {
+                        s.RegisterSpace += UNREAD_SPACE;
+                    }
+                }
+                match root_signature(&host.device, &cparams, &csamplers, true) {
+                    Ok(root) => Some(root),
+                    Err(e) => {
+                        tracing::warn!(error = %e, ?shaders, "host mesh fallback compute root signature refused");
+                        return None;
+                    }
+                }
+            }
+            None => None,
+        };
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
@@ -743,18 +802,20 @@ impl HostPipeline {
             false
         };
         let state = g.describe();
-        if let (Some((f, vertex)), Some((outputs, inputs))) = (fallback, fallback_params) {
+        if let (Some((f, vertex)), Some((outputs, inputs)), Some((compute_root, compute_blob))) =
+            (fallback, fallback_params, compute_root)
+        {
             let bytes = |dxil: &[u8]| D3D12_SHADER_BYTECODE {
                 pShaderBytecode: dxil.as_ptr().cast(),
                 BytecodeLength: dxil.len(),
             };
             let cs = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 // SAFETY: a borrowed pointer the description never releases.
-                pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+                pRootSignature: unsafe { std::mem::transmute_copy(&compute_root) },
                 CS: bytes(&f.compute.dxil),
                 ..Default::default()
             };
-            let name = super::library::name("mesh-fallback-cs", &root_blob, &[&f.compute.dxil], "");
+            let name = super::library::name("mesh-fallback-cs", &compute_blob, &[&f.compute.dxil], "");
             let made = super::library::pipeline(
                 &name,
                 // SAFETY: the description points at live data.
@@ -817,7 +878,7 @@ impl HostPipeline {
             crate::host::name(&compute_pso, || format!("{shaders:?} fallback compute"));
             let signatures = crate::mesh_indirect::signatures(
                 &host.device,
-                &root,
+                (&compute_root, &root),
                 outputs,
                 inputs[0],
                 f.expanded,
@@ -831,6 +892,7 @@ impl HostPipeline {
                 mesh: true,
                 fallback: Some(MeshFallback {
                     compute: compute_pso,
+                    compute_root,
                     layout: f.layout,
                     outputs,
                     inputs,

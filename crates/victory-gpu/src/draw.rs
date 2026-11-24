@@ -1475,14 +1475,19 @@ impl State {
             0
         };
         TESTED_DEPTH.set((tested, false));
-        let root = p.root.as_raw() as usize;
+        // A mesh fallback's compute pass has a root signature of its own.
+        let root_sig = match &p.fallback {
+            Some(f) if compute && !p.compute => &f.compute_root,
+            _ => &p.root,
+        };
+        let root = root_sig.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
             // SAFETY: an open list and a live root signature.
             unsafe {
                 if compute {
-                    l.SetComputeRootSignature(&p.root);
+                    l.SetComputeRootSignature(root_sig);
                 } else {
-                    l.SetGraphicsRootSignature(&p.root);
+                    l.SetGraphicsRootSignature(root_sig);
                 }
             }
             self.host_roots[usize::from(compute)] = root;
@@ -1494,7 +1499,7 @@ impl State {
             unsafe { l.SetPipelineState(pso) };
             self.host_pipeline = pso.as_raw() as usize;
             // The title may release the pipeline before it submits the list.
-            list.bind_pipeline(&p.name, pso, &p.root);
+            list.bind_pipeline(&p.name, pso, root_sig);
         }
         for stage in stages {
             let t = stage.translated();
@@ -3017,6 +3022,7 @@ impl State {
         f: &crate::pipeline::host::MeshFallback,
         x: u32,
     ) -> bool {
+        use crate::host::{ScratchPool, transition};
         if x == 0 {
             return true;
         }
@@ -3027,64 +3033,44 @@ impl State {
             once!(x, "a mesh fallback draw with more than 4 GiB of indices");
             return false;
         };
-        // (At least a little past `u2`'s start, so its address is in the
-        // buffer even when the program has no per-primitive outputs.)
-        let Some(buffer) = list.mesh_scratch(at_prims + prims.max(16)) else {
-            return false;
-        };
-        list.keep(&buffer);
-        // The mesh stage, with the title's graphics arguments, as compute.
+        // Bind before taking a region so a failed bind does not consume the
+        // chunk's first-use transition.
         if !self.bind_as(list, p, &f.compute, &p.stages[..1], false, true) {
             return false;
         }
-        let l = &list.list;
-        // SAFETY: an open list; the buffer lives until the list is reset.
-        let base = unsafe { buffer.GetGPUVirtualAddress() };
-        let barrier = |before, after| D3D12_RESOURCE_BARRIER {
-            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-            Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
-                    // SAFETY: a borrowed pointer; the barrier never releases it.
-                    pResource: unsafe { std::mem::transmute_copy(&buffer) },
-                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                    StateBefore: before,
-                    StateAfter: after,
-                }),
-            },
+        let Some(region) = list.mesh_scratch(ScratchPool::Data, at_prims + prims.max(16)) else {
+            return false;
         };
-        let read =
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_INDEX_BUFFER;
-        // The buffer serves this one draw of the list, so it starts COMMON
-        // (new, or decayed after its last list ran) and ends COMMON.
-        // SAFETY: an open list with the compute pass bound.
+        list.keep(&region.buffer);
+        let l = &list.list;
+        let base = unsafe { region.buffer.GetGPUVirtualAddress() } + region.offset;
+        let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_INDEX_BUFFER;
+        // A new region's chunk starts COMMON; after the first draw it stays
+        // UAV and the pool reuses regions only after the prior draw barrier.
+        if region.first {
+            unsafe { l.ResourceBarrier(&[transition(&region.buffer, D3D12_RESOURCE_STATE_COMMON, uav)]) };
+        }
         unsafe {
-            l.ResourceBarrier(&[barrier(
-                D3D12_RESOURCE_STATE_COMMON,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            )]);
             for (param, at) in f.outputs.into_iter().zip([0, at_indices, at_prims]) {
                 l.SetComputeRootUnorderedAccessView(param, base + at);
             }
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("mesh {x} as compute"), false));
             l.Dispatch(x, 1, 1);
-            l.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read)]);
+            l.ResourceBarrier(&[transition(&region.buffer, uav, read)]);
         }
-        // Then the draw, as any draw (it sets the graphics pipeline again).
         let drawn = self.prepare_for(list, false, true);
         if drawn {
-            // SAFETY: an open list with the draw bound.
             unsafe {
                 for (param, at) in f.inputs.into_iter().zip([0, at_indices, at_prims]) {
                     l.SetGraphicsRootShaderResourceView(param, base + at);
                 }
-                l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(4)); // triangle list
+                l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(4));
                 #[cfg(feature = "diagnostics")]
                 list.note_op(|| self.op_text(format!("mesh {x} drawn"), false));
                 let n = 3 * f.layout.max_primitives * x;
                 if f.expanded {
-                    // Three corners per primitive, read through t1 and t2.
                     l.DrawInstanced(n, 1, 0, 0);
                 } else {
                     l.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW {
@@ -3095,18 +3081,12 @@ impl State {
                     l.DrawIndexedInstanced(n, 1, 0, 0, 0);
                 }
             }
-            // Later draws keep the title's topology.
             self.set_topology(list, self.topology);
         }
-        // SAFETY: an open list; the buffer is back to COMMON.
-        unsafe { l.ResourceBarrier(&[barrier(read, D3D12_RESOURCE_STATE_COMMON)]) };
+        unsafe { l.ResourceBarrier(&[transition(&region.buffer, read, uav)]) };
+        list.mesh_scratch_recycle();
         drawn
     }
-
-    /// An indirect mesh dispatch with a pipeline drawn without mesh shaders
-    /// ([`crate::mesh_indirect`]): `records` clamped records `stride` bytes
-    /// apart at host address `args` (and their count at `count`), both in
-    /// UNORDERED_ACCESS. False if it cannot run.
     fn indirect_mesh_fallback(
         &mut self,
         list: &HostList,
@@ -3115,10 +3095,9 @@ impl State {
         (args, stride, records): (u64, u32, u32),
         count: Option<u64>,
     ) -> bool {
-        use crate::host::transition;
+        use crate::host::{ScratchPool, transition};
         use crate::mesh_indirect::{COMPUTE_STRIDE, draw_stride};
-        let (Some(signatures), Some(convert)) = (&f.signatures, crate::mesh_indirect::convert())
-        else {
+        let (Some(signatures), Some(convert)) = (&f.signatures, crate::mesh_indirect::convert()) else {
             once!("indirect mesh dispatches without mesh shaders dropped");
             return false;
         };
@@ -3131,24 +3110,20 @@ impl State {
         let (Ok(draws32), Ok(index_bytes)) =
             (u32::try_from(draws), u32::try_from(regions.index_bytes))
         else {
-            once!(
-                records,
-                "an indirect mesh dispatch too large for the fallback"
-            );
+            once!(records, "an indirect mesh dispatch too large for the fallback");
             return false;
         };
         let (Some(data), Some(commands)) = (
-            list.mesh_scratch(regions.bytes),
-            list.mesh_scratch(commands_len),
+            list.mesh_scratch(ScratchPool::Data, regions.bytes),
+            list.mesh_scratch(ScratchPool::Commands, commands_len),
         ) else {
             return false;
         };
-        list.keep(&data);
-        list.keep(&commands);
+        list.keep(&data.buffer);
+        list.keep(&commands.buffer);
         let l = &list.list;
-        // SAFETY: an open list; the buffers live until the list is reset.
-        let (base, commands_gpu) =
-            unsafe { (data.GetGPUVirtualAddress(), commands.GetGPUVirtualAddress()) };
+        let base = unsafe { data.buffer.GetGPUVirtualAddress() } + data.offset;
+        let commands_gpu = unsafe { commands.buffer.GetGPUVirtualAddress() } + commands.offset;
         let plan = crate::mesh_indirect::plan(
             (records, stride, count.is_some()),
             &f.layout,
@@ -3157,51 +3132,37 @@ impl State {
             base,
             draws32,
         );
-        let read =
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_INDEX_BUFFER;
+        let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_INDEX_BUFFER;
         let (common, uav, argument) = (
             D3D12_RESOURCE_STATE_COMMON,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
         );
-        // Both buffers serve this one execution of the list: COMMON at both
-        // ends. The pass reads the records the clamp just wrote.
-        // SAFETY: an open list and live buffers.
-        unsafe {
-            l.ResourceBarrier(&[
-                transition(&data, common, uav),
-                transition(&commands, common, uav),
-            ]);
+        if data.first {
+            unsafe { l.ResourceBarrier(&[transition(&data.buffer, common, uav)]) };
+        }
+        if commands.first {
+            unsafe { l.ResourceBarrier(&[transition(&commands.buffer, common, uav)]) };
         }
         crate::mesh_indirect::record(l, convert, &plan, args, count, commands_gpu);
-        // SAFETY: an open list and a live buffer.
-        unsafe { l.ResourceBarrier(&[transition(&commands, uav, argument)]) };
-        // The pass replaced the compute root signature and pipeline.
+        unsafe { l.ResourceBarrier(&[transition(&commands.buffer, uav, argument)]) };
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let mut drawn = false;
         if self.bind_as(list, p, &f.compute, &p.stages[..1], false, true) {
-            // SAFETY: an open list with the compute pass bound and the
-            // commands in INDIRECT_ARGUMENT.
             unsafe {
                 #[cfg(feature = "diagnostics")]
                 list.note_op(|| self.op_text(format!("indirect mesh {records} as compute"), false));
-                l.ExecuteIndirect(&signatures.compute, records, &commands, 0, None, 0);
-                l.ResourceBarrier(&[transition(&data, uav, read)]);
+                l.ExecuteIndirect(&signatures.compute, records, &commands.buffer, commands.offset, None, 0);
+                l.ResourceBarrier(&[transition(&data.buffer, uav, read)]);
             }
             drawn = self.prepare_for(list, false, true);
             if drawn {
-                // SAFETY: an open list with the draw bound.
                 unsafe {
-                    // t0 changes per command; t1 and t2 are the regions'.
-                    for (param, at) in f
-                        .inputs
-                        .into_iter()
-                        .zip([0, regions.indices, regions.prims])
-                    {
+                    for (param, at) in f.inputs.into_iter().zip([0, regions.indices, regions.prims]) {
                         l.SetGraphicsRootShaderResourceView(param, base + at);
                     }
-                    l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(4)); // triangle list
+                    l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(4));
                     if !f.expanded {
                         l.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW {
                             BufferLocation: base + regions.indices,
@@ -3211,21 +3172,16 @@ impl State {
                     }
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("indirect mesh {records} drawn"), false));
-                    l.ExecuteIndirect(&signatures.draw, records, &commands, draws, None, 0);
+                    l.ExecuteIndirect(&signatures.draw, records, &commands.buffer, commands.offset + draws, None, 0);
                 }
                 self.set_topology(list, self.topology);
             }
-            // SAFETY: an open list and a live buffer.
-            unsafe { l.ResourceBarrier(&[transition(&data, read, common)]) };
-        } else {
-            // SAFETY: an open list and a live buffer.
-            unsafe { l.ResourceBarrier(&[transition(&data, uav, common)]) };
+            unsafe { l.ResourceBarrier(&[transition(&data.buffer, read, uav)]) };
         }
-        // SAFETY: an open list and a live buffer.
-        unsafe { l.ResourceBarrier(&[transition(&commands, argument, common)]) };
+        unsafe { l.ResourceBarrier(&[transition(&commands.buffer, argument, uav)]) };
+        list.mesh_scratch_recycle();
         drawn
     }
-
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
