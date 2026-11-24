@@ -1143,6 +1143,9 @@ pub(crate) struct HostList {
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
+    /// Shader-writable memory for what mesh programs run as compute write
+    /// (see [`HostList::mesh_scratch`]), reused after a reset.
+    mesh_scratch: Mutex<MeshScratch>,
     /// Host texture states the list assumes, by host copy: at its start and
     /// at its end. Lists are recorded on many threads and run in submission
     /// order, so the transitions from a texture's real state are made at
@@ -2171,6 +2174,14 @@ struct CardPlan {
     looks: Option<upcheck::Looks>,
     /// With [`send`]: the memory its sends come from.
     sends: Option<send::Memory>,
+}
+
+/// Default-heap buffers a list's mesh fallback draws write and read, one per
+/// draw while they last: each draw moves its whole buffer between states.
+#[derive(Default)]
+struct MeshScratch {
+    buffers: Vec<(ID3D12Resource, u64)>,
+    next: usize,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -3929,6 +3940,18 @@ impl Host {
         })
     }
 
+    /// Run mesh programs as compute and draw the generated buffers when the
+    /// device lacks native mesh shaders, or when `VICTORY_MESH_FALLBACK=1`.
+    pub(crate) fn mesh_fallback(&self) -> bool {
+        static FALLBACK: OnceLock<bool> = OnceLock::new();
+        *FALLBACK.get_or_init(|| {
+            let forced = std::env::var("VICTORY_MESH_FALLBACK").is_ok_and(|v| v == "1");
+            let fallback = forced || !self.mesh_shaders();
+            tracing::info!(fallback, forced, "mesh programs run as compute");
+            fallback
+        })
+    }
+
     /// Whether the host GPU supports the depth bounds test; logged once.
     pub(crate) fn depth_bounds(&self) -> bool {
         static BOUNDS: OnceLock<bool> = OnceLock::new();
@@ -4039,6 +4062,7 @@ impl Host {
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
+                mesh_scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 prelude,
@@ -6197,6 +6221,10 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
+        self.mesh_scratch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .next = 0;
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -6859,6 +6887,29 @@ impl HostList {
     pub(crate) fn scratch_kept(&self) -> u64 {
         let scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         scratch.chunks.iter().map(|c| c.1).sum()
+    }
+
+    /// A shader-writable buffer of at least `len` bytes for one mesh fallback
+    /// draw, in COMMON state; the draw leaves it so. Each draw of the list
+    /// gets its own buffer until the list is reset, so a draw's transitions
+    /// never touch another's data.
+    // shortcut: one buffer per draw (grown, never shared); a pool sliced by
+    // offset with UAV barriers would take less memory.
+    pub(crate) fn mesh_scratch(&self, len: u64) -> Option<ID3D12Resource> {
+        let len = len.max(256).next_power_of_two();
+        let mut s = self.mesh_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        let n = s.next;
+        if n == s.buffers.len() || s.buffers[n].1 < len {
+            let buffer = host()?.uav_buffer(len)?;
+            name(&buffer, || format!("mesh fallback scratch {len:#x}"));
+            if n == s.buffers.len() {
+                s.buffers.push((buffer, len));
+            } else {
+                s.buffers[n] = (buffer, len);
+            }
+        }
+        s.next += 1;
+        Some(s.buffers[n].0.clone())
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
