@@ -4612,7 +4612,7 @@ impl<'a> Lower<'a> {
         let fits = |m: super::shader::Mesh| {
             mesh_output_bytes(outputs, prims, m.max_vertices, m.max_primitives) <= MESH_OUTPUT_LIMIT
         };
-        if !fits(mesh) {
+        if !fits(mesh) && !self.s.mesh_as_compute {
             mesh.max_vertices = mesh.max_vertices.min(threads);
             mesh.max_primitives = mesh.max_primitives.min(threads);
             // shortcut: outputs past the cap even at the lane count are

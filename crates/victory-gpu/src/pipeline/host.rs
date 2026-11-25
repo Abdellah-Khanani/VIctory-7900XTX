@@ -836,7 +836,7 @@ impl HostPipeline {
                 pRootSignature: unsafe { std::mem::transmute_copy(&root) },
                 VS: bytes(&vertex.dxil),
                 PS: code(1),
-                BlendState: g.blend,
+                BlendState: host_blend(&g.blend, &g.targets),
                 SampleMask: g.sample_mask,
                 RasterizerState: g.rasterizer,
                 DepthStencilState: g.depth,

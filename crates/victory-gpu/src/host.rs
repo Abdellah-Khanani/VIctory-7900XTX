@@ -2213,7 +2213,15 @@ static FREE_CHUNKS: std::sync::Mutex<Vec<(ID3D12Resource, u64)>> = std::sync::Mu
 
 /// What [`FREE_CHUNKS`] keeps at most; chunks past it wait in
 /// [`RELEASING`] before they are released.
-const FREE_CHUNKS_MAX: u64 = 512 << 20;
+fn free_chunks_max() -> u64 {
+    static VALUE: OnceLock<u64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("VICTORY_MESH_FREE_MIB")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map_or(512 << 20, |mib| mib << 20)
+    })
+}
 
 /// Chunks to release, per list reset, oldest first.
 #[allow(clippy::type_complexity)]
@@ -2221,7 +2229,15 @@ static RELEASING: std::sync::Mutex<std::collections::VecDeque<Vec<(ID3D12Resourc
     std::sync::Mutex::new(std::collections::VecDeque::new());
 
 /// How many list resets a chunk waits before it is released.
-const RELEASE_DELAY: usize = 128;
+fn release_delay() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("VICTORY_MESH_RELEASE_DELAY")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(128)
+    })
+}
 
 /// Bytes of mesh fallback chunks alive (held, free or waiting).
 static MESH_CHUNK_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -6348,7 +6364,7 @@ impl HostList {
             for pool in &mut scratch.pools {
                 for (buffer, size) in pool.release() {
                     let held: u64 = free.iter().map(|(_, s)| s).sum();
-                    if held + size <= FREE_CHUNKS_MAX {
+                    if held + size <= free_chunks_max() {
                         free.push((buffer, size));
                     } else {
                         excess.push((buffer, size));
@@ -6357,7 +6373,7 @@ impl HostList {
             }
             // One entry per reset, so a chunk waits RELEASE_DELAY resets.
             late.push_back(excess);
-            while late.len() > RELEASE_DELAY {
+            while late.len() > release_delay() {
                 for (_, size) in late.pop_front().unwrap_or_default() {
                     MESH_CHUNK_BYTES.fetch_sub(size, std::sync::atomic::Ordering::Relaxed);
                 }
