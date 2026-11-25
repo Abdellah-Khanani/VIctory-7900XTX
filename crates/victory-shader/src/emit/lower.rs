@@ -1579,6 +1579,11 @@ impl<'a> Lower<'a> {
                 topology: ms.topology,
             });
             s.mesh_as_compute = x.mesh_as_compute;
+            // A wave64 mesh program run as compute needs the native wave
+            // width so ballots, lane reads and mesh LDS semantics agree.
+            if s.mesh_as_compute && x.native.wave64 {
+                s.wave_size = Some(64);
+            }
             // Barriers order the lanes' LDS accesses; the console's
             // allocation request needs them too, but the host does not. One
             // lane sends that request, and what it dominates (the path for
